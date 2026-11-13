@@ -15,6 +15,7 @@ package main
 //   5. 只有确认直连才允许测速，否则直接跳过并给出可操作的提示。
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -162,6 +163,29 @@ func directClient(bindPhysical bool, timeout time.Duration) *http.Client {
 		MaxIdleConns:          128,
 		MaxIdleConnsPerHost:   64,
 		IdleConnTimeout:       45 * time.Second,
+		TLSHandshakeTimeout:   timeout,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	return &http.Client{Transport: tr, Timeout: timeout}
+}
+
+// 只走 IPv4 的直连客户端。
+//
+// 双栈机器上，ipip.net 这类站点常优先用 IPv6 回包，返回的是 IPv6 地址；
+// 只解析 IPv4 的代码就会认为「没拿到」，退到被代理的国外源，
+// 于是同一条宽带每次跑出来的公网 IPv4 都不一样。
+// 查 IPv4 出口就必须强制用 IPv4 拨号。
+func directClientV4(timeout time.Duration) *http.Client {
+	d := &net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
+	tr := &http.Transport{
+		Proxy: nil,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return d.DialContext(ctx, "tcp4", addr)
+		},
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          16,
+		MaxIdleConnsPerHost:   8,
+		IdleConnTimeout:       30 * time.Second,
 		TLSHandshakeTimeout:   timeout,
 		ExpectContinueTimeout: 1 * time.Second,
 	}

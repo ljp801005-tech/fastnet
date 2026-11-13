@@ -59,8 +59,10 @@
 | 平台 | 文件 | 说明 |
 | --- | --- | --- |
 | Windows 10/11 x64 | `FastNet-Win-v*.zip` | 双击 `fastnet.exe` |
-| macOS 10.15+ | `FastNet-mac-v*.zip` | Intel / Apple Silicon 通用，右键打开 `启动FastNet.command` |
+| macOS 11+ | `FastNet-mac-v*.zip` | Intel / Apple Silicon 通用，右键打开 `启动FastNet.command` |
 | 安卓 8+ / iOS | `FastNet-Android-v*.html` | 用 Chrome / Safari 打开 |
+
+> macOS 版最低要求 **11.0（Big Sur）**，这是 Go 1.23 编译器的下限，10.15 Catalina 无法运行。Intel 与 Apple Silicon 是同一个文件，不需要分别下载。
 
 ---
 
@@ -68,7 +70,7 @@
 
 ### Windows
 
-1. 解压 `FastNet-Win-v1.1.2.zip`；
+1. 解压 `FastNet-Win-v1.1.3.zip`；
 2. 双击 `fastnet.exe`，出现中文菜单；
 3. 按 `A` 一键体检（约 20~40 秒），或按数字单测某一项。
 
@@ -77,19 +79,24 @@
 
 ### macOS
 
-1. 解压 `FastNet-mac-v1.1.2.zip`；
+1. 解压 `FastNet-mac-v1.1.3.zip`（解压后是一个 `mac` 文件夹，里面三个文件）；
 2. **右键点 `启动FastNet.command` → 打开**（第一次必须右键，直接双击会被 Gatekeeper 拦）；
 3. 之后就能正常双击了。
 
 如果提示「无法打开，因为 Apple 无法验证」：
 
 ```bash
-cd 解压目录
+cd 解压目录          # 进到 mac 文件夹
 xattr -dr com.apple.quarantine .
 ./fastnet
 ```
 
-启动器内部已经带了 `xattr` 清理，只有第一次需要手动放行。
+**macOS 15（Sequoia）及以后没有「右键 → 打开」这一步了**，苹果已经移除了这个绕过方式。提示被拦时：
+
+- 打开 **系统设置 → 隐私与安全性**，往下翻到「安全性」，会看到一行「已阻止使用 fastnet」，点 **仍要打开**，再输一次密码；
+- 或者直接在终端里执行上面的 `xattr` 命令，之后就可以双击了。
+
+启动器内部也带了 `xattr` 清理，但**它得先被允许运行才能清理**，所以第一次被拦时请用上面两种方式之一放行，之后就不需要了。
 
 ### 安卓 / iPhone
 
@@ -104,7 +111,7 @@ xattr -dr com.apple.quarantine .
 
 **方式二：只用手机，不碰电脑**
 
-把 `FastNet-Android-v1.1.2.html` 传到手机（微信文件传输助手 / QQ / 数据线都行），用 Chrome 打开。`#auto` 结尾的地址（如 `...html#auto`）可以打开就自动开测。
+把 `FastNet-Android-v1.1.3.html` 传到手机（微信文件传输助手 / QQ / 数据线都行），用 Chrome 打开。`#auto` 结尾的地址（如 `...html#auto`）可以打开就自动开测。
 
 > 手机端受浏览器沙箱限制，**测不了「手机 ↔ 路由器」的内网带宽**，也没有精确的 NAT1/2/3/4 判定（只能分锥形/对称）。这两项请用桌面版。页面里也写了这条提示。
 
@@ -327,6 +334,13 @@ lipo -create -output fastnet fn-arm64 fn-amd64
 ---
 
 ## 更新日志
+
+**v1.1.3**
+- 修掉「公网 IPv4 每次跑出来不一样、偶尔还为空」：双栈机器上 `myip.ipip.net` 会优先用 **IPv6** 回包，原代码只解析 IPv4，匹配不到就静默退到国外 geoip 源，而那些源在 Clash 分流里走代理，返回的是代理节点出口
+- 查 IPv4 出口改为**强制 IPv4 拨号**（新增 `directClientV4`），并补充 `ip.3322.net`、`ddns.oray.com` 两个国内回显源做兜底
+- 归属地改为按 IP 反查（百度开放数据给中文、ipinfo 给 ASN 兜底），不再依赖回显源自带的地域信息；结论里 `位置/运营商` 不再只剩一个「DE」这样的国家代码
+- 兜底到国外源时明确提示「这个地址更像代理/机房出口」，不再把代理 IP 当成宽带 IP 呈现
+- README 修正 macOS 最低版本：**实际要求 11.0（Big Sur）**，原先写的 10.15 是错的；补充 macOS 15 起「右键 → 打开」已失效，需到系统设置里放行的说明
 
 **v1.1.2**
 - 下行测速端点从 `speed.cloudflare.com/__down` 换成**国内镜像大文件 + 长连接流式读取、多源并发**：原先 4 并发反复拉 10MB 会触发 Cloudflare 429/403，且跨境链路本来就测不出本地带宽

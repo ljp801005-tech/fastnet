@@ -244,22 +244,52 @@ func proxyEnvValue() string {
 	return ""
 }
 
-func getPublicIPv4() (ip, loc, isp, asn string) {
-	// 1) ipip.net：国内运营商信息最准
-	if body, err := getBody("https://myip.ipip.net", 2 * time.Second); err == nil {
+// 公网出口查询必须走 IPv4 直连，并且要多国内源兜底。
+//
+// 这里踩过两个坑，都会让同一条宽带每次跑出来的 IP 不一样：
+//  1. 双栈机器上 myip.ipip.net 会优先用 IPv6 回包，只解析 IPv4 就「查不到」，
+//     于是静默退到国外的 geoip 源；
+//  2. 国外源在 Clash 分流规则里走代理，返回的是代理节点出口，不是本机宽带。
+//
+// 所以：强制 IPv4 拨号 + 多个国内回显源 + 最后才用国外源并标注「疑似代理出口」。
+// 归属地一律按 IP 反查，避免依赖回显源自己带的地域信息。
+func getPublicIPv4() (ip, loc, isp, asn string, proxied bool) {
+	c := directClientV4(4 * time.Second)
+	defer c.CloseIdleConnections()
+
+	// 1) ipip.net：顺带给出国内运营商
+	if body, err := httpText(c, "https://myip.ipip.net"); err == nil {
 		if m := ipv4Re.FindStringSubmatch(body); len(m) > 1 {
 			ip = m[1]
 			if i := strings.Index(body, "来自于"); i >= 0 {
 				loc = strings.TrimSpace(body[i+len("来自于"):])
-				loc = strings.TrimPrefix(loc, "：")
-				loc = strings.TrimPrefix(loc, ":")
+				loc = strings.TrimPrefix(strings.TrimPrefix(loc, "："), ":")
 				loc = strings.Join(strings.Fields(loc), " ")
+			}
+			if loc == "" {
+				loc, isp, asn = geoLookup(c, ip)
 			}
 			return
 		}
 	}
-	// 2) ip.sb：JSON，含 ASN
-	if body, err := getBody("https://api.ip.sb/geoip", 2 * time.Second); err == nil {
+
+	// 2) 国内纯文本回显源：只返回一个 IPv4，最稳，不带地域信息
+	for _, u := range []string{"https://ip.3322.net", "https://ddns.oray.com/checkip"} {
+		body, err := httpText(c, u)
+		if err != nil {
+			continue
+		}
+		m := ipv4Re.FindStringSubmatch(body)
+		if len(m) < 2 {
+			continue
+		}
+		ip = m[1]
+		loc, isp, asn = geoLookup(c, ip)
+		return
+	}
+
+	// 3) ip.sb：JSON，含 ASN
+	if body, err := httpText(c, "https://api.ip.sb/geoip"); err == nil {
 		var r struct {
 			IP      string `json:"ip"`
 			City    string `json:"city"`
@@ -274,11 +304,13 @@ func getPublicIPv4() (ip, loc, isp, asn string) {
 			loc = strings.TrimSpace(r.Country + " " + r.Region + " " + r.City)
 			isp = r.ISP
 			asn = "AS" + r.ASN + " " + r.ASNOrg
+			proxied = hostingEgress(r.ISP + " " + r.ASNOrg)
 			return
 		}
 	}
-	// 3) Cloudflare trace
-	if body, err := getBody("https://www.cloudflare.com/cdn-cgi/trace", 2 * time.Second); err == nil {
+
+	// 4) Cloudflare trace：最后一个兜底，分流下基本走代理
+	if body, err := httpText(c, "https://www.cloudflare.com/cdn-cgi/trace"); err == nil {
 		for _, l := range strings.Split(body, "\n") {
 			if strings.HasPrefix(l, "ip=") {
 				ip = strings.TrimPrefix(l, "ip=")
@@ -286,13 +318,80 @@ func getPublicIPv4() (ip, loc, isp, asn string) {
 				loc = "地区代码 " + strings.TrimPrefix(l, "loc=")
 			}
 		}
+		if ip != "" {
+			proxied = true // 国内源全没通，出口很可能是代理节点
+			if isp == "" {
+				if org := strings.TrimSpace(probeOrg(c, ip)); org != "" {
+					isp = org
+					proxied = proxied || hostingEgress(org)
+				}
+			}
+		}
 	}
 	return
 }
 
+// 按 IP 反查归属地与运营商。查的是指定 IP，所以即使请求本身被代理也不影响结果。
+func geoLookup(c *http.Client, ip string) (loc, isp, asn string) {
+	// 百度开放数据：返回中文「省 市 运营商」，国内直连、响应快
+	if body, err := httpText(c, "https://opendata.baidu.com/api.php?query="+ip+"&co=&resource_id=6006&oe=utf-8"); err == nil {
+		var r struct {
+			Data []struct {
+				Location string `json:"location"`
+			} `json:"data"`
+		}
+		if json.Unmarshal([]byte(body), &r) == nil && len(r.Data) > 0 {
+			if s := strings.Join(strings.Fields(r.Data[0].Location), " "); s != "" {
+				loc = "中国 " + s
+				return
+			}
+		}
+	}
+
+	// ipinfo：英文，但带 ASN/ORG，用来判定是不是机房出口
+	body, err := httpText(c, "https://ipinfo.io/"+ip+"/json")
+	if err != nil {
+		return
+	}
+	var r struct {
+		City    string `json:"city"`
+		Region  string `json:"region"`
+		Country string `json:"country"`
+		Org     string `json:"org"`
+	}
+	if json.Unmarshal([]byte(body), &r) != nil {
+		return
+	}
+	country := cnCountry(r.Country)
+	loc = strings.Join(strings.Fields(country+" "+r.Region+" "+r.City), " ")
+	isp = r.Org
+	if strings.HasPrefix(r.Org, "AS") {
+		if f := strings.Fields(r.Org); len(f) > 1 {
+			asn = f[0] + " " + strings.Join(f[1:], " ")
+		}
+	}
+	return
+}
+
+// 常见国家/地区代码转中文，保证和国内源输出风格一致
+func cnCountry(code string) string {
+	m := map[string]string{
+		"CN": "中国", "HK": "中国香港", "MO": "中国澳门", "TW": "中国台湾",
+		"US": "美国", "JP": "日本", "SG": "新加坡", "KR": "韩国",
+		"GB": "英国", "DE": "德国", "FR": "法国", "NL": "荷兰",
+		"RU": "俄罗斯", "CA": "加拿大", "AU": "澳大利亚", "IN": "印度",
+	}
+	if v, ok := m[strings.ToUpper(strings.TrimSpace(code))]; ok {
+		return v
+	}
+	return strings.ToUpper(code)
+}
+
 func getPublicIPv6() string {
+	c := directClient(false, 3*time.Second)
+	defer c.CloseIdleConnections()
 	for _, u := range []string{"https://api6.ipify.org", "https://v6.ident.me", "https://ipv6.ip.sb"} {
-		if body, err := getBody(u, 2 * time.Second); err == nil {
+		if body, err := httpText(c, u); err == nil {
 			body = strings.TrimSpace(body)
 			if ip := net.ParseIP(body); ip != nil && ip.To4() == nil {
 				return body
@@ -324,7 +423,7 @@ func runEnv() *EnvInfo {
 	}
 
 	fmt.Println("  " + col(cBold, "公网出口"))
-	ip, loc, isp, asn := getPublicIPv4()
+	ip, loc, isp, asn, proxied := getPublicIPv4()
 	e.PublicIPv4, e.Location, e.ISP, e.ASN = ip, loc, isp, asn
 	if ip != "" {
 		ok("IPv4: " + ip)
@@ -336,6 +435,11 @@ func runEnv() *EnvInfo {
 		}
 		if asn != "" {
 			info("ASN: " + asn)
+		}
+		if proxied {
+			warn("这个地址更像代理/机房出口，不一定是你家宽带的 IP")
+			info("开了 Clash/V2Ray 的分流时，国内源可能被直接放行、国外源走代理")
+			info("想确认真实宽带出口：关掉代理后再跑一次；内网带宽（菜单 8）不受影响")
 		}
 	} else {
 		bad("无法获取公网 IPv4（可能被代理/防火墙拦截，或网络不通）")
@@ -1180,8 +1284,13 @@ func summaryBanner(rep *Report) {
 	title("体检结论")
 	if rep.Env != nil {
 		line("公网 IPv4", rep.Env.PublicIPv4)
-		if rep.Env.Location != "" {
-			line("位置/运营商", rep.Env.Location)
+		// 兜底源只给了国家代码，把运营商补在后面，避免结论里只剩一个「DE」
+		locLine := rep.Env.Location
+		if rep.Env.ISP != "" && !strings.Contains(locLine, rep.Env.ISP) {
+			locLine = strings.TrimSpace(locLine + " " + rep.Env.ISP)
+		}
+		if locLine != "" {
+			line("位置/运营商", locLine)
 		}
 		if rep.Env.PublicIPv6 != "" {
 			line("公网 IPv6", rep.Env.PublicIPv6)
@@ -1243,7 +1352,7 @@ func summaryBanner(rep *Report) {
 
 // ================= 主流程 =================
 
-const version = "1.1.2"
+const version = "1.1.3"
 
 var stdin = bufio.NewReader(os.Stdin)
 
