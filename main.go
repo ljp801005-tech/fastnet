@@ -143,14 +143,23 @@ func getBody(rawurl string, timeout time.Duration) (string, error) {
 		return "", err
 	}
 	defer resp.Body.Close()
-	b, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return "", err
-	}
 	if resp.StatusCode != 200 {
 		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	return string(b), nil
+	// 拿到内容就返回，不等服务器主动断流（部分站点 keep-alive 会拖到超时）。
+	r := io.LimitReader(resp.Body, 1<<20)
+	var sb strings.Builder
+	buf := make([]byte, 4096)
+	for i := 0; i < 16 && sb.Len() < 1<<20; i++ {
+		n, e := r.Read(buf)
+		if n > 0 {
+			sb.Write(buf[:n])
+		}
+		if e != nil {
+			break
+		}
+	}
+	return sb.String(), nil
 }
 
 var ipv4Re = regexp.MustCompile(`\b(\d{1,3}(?:\.\d{1,3}){3})\b`)
@@ -237,7 +246,7 @@ func proxyEnvValue() string {
 
 func getPublicIPv4() (ip, loc, isp, asn string) {
 	// 1) ipip.net：国内运营商信息最准
-	if body, err := getBody("https://myip.ipip.net", cfg.Timeout); err == nil {
+	if body, err := getBody("https://myip.ipip.net", 2 * time.Second); err == nil {
 		if m := ipv4Re.FindStringSubmatch(body); len(m) > 1 {
 			ip = m[1]
 			if i := strings.Index(body, "来自于"); i >= 0 {
@@ -250,7 +259,7 @@ func getPublicIPv4() (ip, loc, isp, asn string) {
 		}
 	}
 	// 2) ip.sb：JSON，含 ASN
-	if body, err := getBody("https://api.ip.sb/geoip", cfg.Timeout); err == nil {
+	if body, err := getBody("https://api.ip.sb/geoip", 2 * time.Second); err == nil {
 		var r struct {
 			IP      string `json:"ip"`
 			City    string `json:"city"`
@@ -269,7 +278,7 @@ func getPublicIPv4() (ip, loc, isp, asn string) {
 		}
 	}
 	// 3) Cloudflare trace
-	if body, err := getBody("https://www.cloudflare.com/cdn-cgi/trace", cfg.Timeout); err == nil {
+	if body, err := getBody("https://www.cloudflare.com/cdn-cgi/trace", 2 * time.Second); err == nil {
 		for _, l := range strings.Split(body, "\n") {
 			if strings.HasPrefix(l, "ip=") {
 				ip = strings.TrimPrefix(l, "ip=")
@@ -283,7 +292,7 @@ func getPublicIPv4() (ip, loc, isp, asn string) {
 
 func getPublicIPv6() string {
 	for _, u := range []string{"https://api6.ipify.org", "https://v6.ident.me", "https://ipv6.ip.sb"} {
-		if body, err := getBody(u, cfg.Timeout); err == nil {
+		if body, err := getBody(u, 2 * time.Second); err == nil {
 			body = strings.TrimSpace(body)
 			if ip := net.ParseIP(body); ip != nil && ip.To4() == nil {
 				return body
@@ -392,11 +401,17 @@ func runLatency() []latencyResult {
 		r := latencyResult{Name: t.Name, Addr: t.Addr}
 		var samples []float64
 		attempts := 6
+		fails := 0
 		for i := 0; i < attempts; i++ {
-			d, err := tcpRTT(t.Addr, 3*time.Second)
+			d, err := tcpRTT(t.Addr, 1500*time.Millisecond)
 			if err != nil {
+				fails++
+				if fails >= 2 { // 连续两次不通就跳过，不再干等 18 秒
+					break
+				}
 				continue
 			}
+			fails = 0
 			if i > 0 { // 丢弃首次（DNS/ARP 影响）
 				samples = append(samples, float64(d.Microseconds())/1000.0)
 			}
@@ -433,10 +448,38 @@ func runLatency() []latencyResult {
 
 // ================= 3/4. 上下行测速 =================
 
-const (
-	downURL = "https://speed.cloudflare.com/__down?bytes=10485760"
-	upURL   = "https://speed.cloudflare.com/__up"
-)
+// 下行改用国内镜像大文件 + 长连接流式读取。
+// Cloudflare 的 __down 在境内常被 429/403 限流，且跨境链路本来就测不出本地带宽。
+// 多个不同镜像并发，避免单一站点限速；一次请求读满整个时间窗口，不再反复请求触发限流。
+var downTargets = []string{
+	"https://mirrors.huaweicloud.com/centos-vault/7.9.2009/isos/x86_64/CentOS-7-x86_64-DVD-2009.iso",
+	"https://mirrors.ustc.edu.cn/centos-vault/7.9.2009/isos/x86_64/CentOS-7-x86_64-DVD-2009.iso",
+	"https://mirrors.nju.edu.cn/centos-vault/7.9.2009/isos/x86_64/CentOS-7-x86_64-DVD-2009.iso",
+	"https://mirrors.huaweicloud.com/centos-vault/7.9.2009/isos/x86_64/CentOS-7-x86_64-DVD-2009.iso",
+}
+
+const upURL = "https://speed.cloudflare.com/__up"
+
+// 边收边发边计数，进度条不再等到整个块传完才动。
+type countWriter struct{ n *int64 }
+
+func (w countWriter) Write(p []byte) (int, error) {
+	atomic.AddInt64(w.n, int64(len(p)))
+	return len(p), nil
+}
+
+type countReader struct {
+	r io.Reader
+	n *int64
+}
+
+func (r countReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	if n > 0 {
+		atomic.AddInt64(r.n, int64(n))
+	}
+	return n, err
+}
 
 type speedResult struct {
 	Direction string  `json:"direction"`
@@ -454,6 +497,7 @@ type speedResult struct {
 func speedProgress(label string, total *int64, start time.Time, done <-chan struct{}) {
 	tk := time.NewTicker(300 * time.Millisecond)
 	defer tk.Stop()
+	warned := false
 	for {
 		select {
 		case <-done:
@@ -464,6 +508,11 @@ func speedProgress(label string, total *int64, start time.Time, done <-chan stru
 				continue
 			}
 			b := atomic.LoadInt64(total)
+			if el > 3 && b == 0 && !warned {
+				warned = true
+				fmt.Println()
+				info("还没有数据返回（对端较慢或正在换源重试），测速仍在继续…")
+			}
 			fmt.Printf("\r  %s %6.2f Mbps  (已传输 %.1f MB / %.1fs)   ",
 				label, float64(b)*8/el/1e6, float64(b)/1048576, el)
 		}
@@ -472,13 +521,18 @@ func speedProgress(label string, total *int64, start time.Time, done <-chan stru
 
 func runSpeed(up bool) speedResult {
 	name := "下载测速"
-	target := downURL
+	server := "国内镜像（多源并发）"
 	if up {
 		name = "上传测速"
-		target = upURL
+		server = "speed.cloudflare.com（国际出口）"
 	}
-	title(name + " (Cloudflare)")
-	info(fmt.Sprintf("时长 %d 秒 / 并发 %d / 数据源 speed.cloudflare.com", cfg.SpeedSeconds, cfg.SpeedConns))
+	title(name + " · " + server)
+	info(fmt.Sprintf("时长 %d 秒 / 并发 %d / 长连接持续传输", cfg.SpeedSeconds, cfg.SpeedConns))
+	if up {
+		info("上行走 Cloudflare 国际端点：1000M 家宽上行通常只有 30~100 Mbps，与下行不对称属正常")
+	} else {
+		info("下行使用国内 CDN 大文件，测的是本机接入链路可达速率，不是国际出口速率")
+	}
 
 	direction := map[bool]string{true: "upload", false: "download"}[up]
 
@@ -496,12 +550,12 @@ func runSpeed(up bool) speedResult {
 		if path.Note != "" {
 			info(path.Note)
 		}
-		info("请关闭系统代理 / Clash TUN 模式，或把 speed.cloudflare.com 加入直连规则后重测")
+		info("请关闭系统代理 / Clash TUN 模式后重测，或把测速目标加入直连规则")
 		info("只想验证内网瓶颈可用菜单 8（内网带宽），它不走公网、不受代理影响")
 		return speedResult{
 			Direction: direction,
 			Conns:     cfg.SpeedConns,
-			Server:    "speed.cloudflare.com",
+			Server:    server,
 			Skipped:   true,
 			Reason:    strings.Join(path.Reasons, "; "),
 			Egress:    path.SpeedIP,
@@ -518,7 +572,7 @@ func runSpeed(up bool) speedResult {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.SpeedSeconds)*time.Second)
 	defer cancel()
 
-	client := directClient(path.BindPhysical, 60*time.Second)
+	client := directClient(path.BindPhysical, 20*time.Second)
 	defer client.CloseIdleConnections()
 
 	payload := make([]byte, 8<<20)
@@ -535,32 +589,45 @@ func runSpeed(up bool) speedResult {
 
 	for i := 0; i < cfg.SpeedConns; i++ {
 		wg.Add(1)
-		go func() {
+		go func(id int) {
 			defer wg.Done()
+			cur := id % len(downTargets)
 			for ctx.Err() == nil {
+				var sent int64
 				var req *http.Request
 				var err error
 				if up {
-					req, err = http.NewRequestWithContext(ctx, "POST", target, bytes.NewReader(payload))
-					if err != nil {
-						return
+					// 上传量按「成功发出的请求体」计，失败的请求不算数。
+					body := &countReader{r: bytes.NewReader(payload), n: &sent}
+					req, err = http.NewRequestWithContext(ctx, "POST", upURL, body)
+					if err == nil {
+						req.ContentLength = int64(len(payload))
+						req.Header.Set("Content-Type", "application/octet-stream")
 					}
-					req.ContentLength = int64(len(payload))
-					req.Header.Set("Content-Type", "application/octet-stream")
 				} else {
-					req, err = http.NewRequestWithContext(ctx, "GET", target, nil)
-					if err != nil {
-						return
+					req, err = http.NewRequestWithContext(ctx, "GET", downTargets[cur], nil)
+					if err == nil {
+						req.Header.Set("Range", "bytes=0-") // 长连接持续读，读满窗口再取消
 					}
+				}
+				if err != nil {
+					return
 				}
 				resp, err := client.Do(req)
 				if err != nil {
 					if ctx.Err() == nil {
 						errOnce.Do(func() { firstErr = err })
 					}
-					return
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(200 * time.Millisecond):
+						continue
+					}
 				}
-				if resp.StatusCode != http.StatusOK {
+				if resp.StatusCode != http.StatusOK &&
+					resp.StatusCode != http.StatusPartialContent &&
+					resp.StatusCode != http.StatusNoContent {
 					body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
 					resp.Body.Close()
 					msg := strings.TrimSpace(string(body))
@@ -570,40 +637,48 @@ func runSpeed(up bool) speedResult {
 					errOnce.Do(func() {
 						firstErr = fmt.Errorf("HTTP %d %s", resp.StatusCode, msg)
 					})
+					if !up {
+						cur = (cur + 1) % len(downTargets) // 该镜像不可用就换下一个
+					}
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(200 * time.Millisecond):
+						continue
+					}
+				}
+				if up {
+					if sent > 0 { // 请求体发完就计数，不必等响应体读完
+						atomic.AddInt64(&total, sent)
+					}
+					_, _ = io.Copy(io.Discard, resp.Body)
+					resp.Body.Close()
+				} else {
+					_, _ = io.Copy(countWriter{n: &total}, resp.Body) // 边收边计数
+					resp.Body.Close()
+				}
+				select {
+				case <-ctx.Done():
 					return
+				case <-time.After(30 * time.Millisecond):
 				}
-				n, copyErr := io.Copy(io.Discard, resp.Body)
-				resp.Body.Close()
-				if up && n == 0 {
-					n = int64(len(payload))
-				}
-				// 过小的响应多半是错误页/CDN 提示，不能计入带宽
-				if n < 65536 {
-					return
-				}
-				if copyErr != nil && n == 0 {
-					return
-				}
-				atomic.AddInt64(&total, n)
 			}
-		}()
+		}(i)
 	}
 
-	// 等测速时间到，或所有连接都失败
-	for {
-		select {
-		case <-time.After(200 * time.Millisecond):
-			if ctx.Err() != nil {
-				goto finish
-			}
-			if atomic.LoadInt64(&total) == 0 && firstErr != nil {
-				goto finish
-			}
-		}
-	}
+	<-ctx.Done()
 
-finish:
-	wg.Wait()
+	// 收尾等待加硬上限，绝不让一个挂住的连接把整个体检卡死。
+	waitCh := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(waitCh)
+	}()
+	select {
+	case <-waitCh:
+	case <-time.After(5 * time.Second):
+		warn("部分连接未在 5 秒内退出，已跳过等待（不影响已有结果）")
+	}
 	close(done)
 	elapsed := time.Since(start).Seconds()
 	fmt.Printf("\r%60s\r", "")
@@ -613,7 +688,7 @@ finish:
 		Bytes:     atomic.LoadInt64(&total),
 		Seconds:   elapsed,
 		Conns:     cfg.SpeedConns,
-		Server:    "speed.cloudflare.com",
+		Server:    server,
 	}
 	if elapsed > 0 {
 		res.Bps = float64(res.Bytes) * 8 / elapsed
@@ -624,8 +699,8 @@ finish:
 		bad(name + " 数据不足，未得到有效结果")
 		if firstErr != nil {
 			info("原因: " + firstErr.Error())
-			if strings.Contains(firstErr.Error(), "429") {
-				warn("测速端点限流（429），请等 1-2 分钟再测，或减少并发连接数")
+			if strings.Contains(firstErr.Error(), "429") || strings.Contains(firstErr.Error(), "403") {
+				warn("测速端点限流/拒绝，已自动切换备用镜像；若仍失败请稍后重试")
 			}
 		}
 		res.Bps, res.Mbps = 0, 0
@@ -1133,14 +1208,14 @@ func summaryBanner(rep *Report) {
 		if rep.Download.Skipped {
 			line("下行带宽", "已跳过（代理环境，不测代理链路）")
 		} else if rep.Download.Bps > 0 {
-			line("下行带宽", rate(rep.Download.Bps))
+			line("下行带宽", rate(rep.Download.Bps)+"（国内源）")
 		}
 	}
 	if rep.Upload != nil {
 		if rep.Upload.Skipped {
 			line("上行带宽", "已跳过（代理环境，不测代理链路）")
 		} else if rep.Upload.Bps > 0 {
-			line("上行带宽", rate(rep.Upload.Bps))
+			line("上行带宽", rate(rep.Upload.Bps)+"（国际出口参考）")
 		}
 	}
 	if rep.NAT != nil && rep.NAT.Type != "" {
@@ -1168,7 +1243,7 @@ func summaryBanner(rep *Report) {
 
 // ================= 主流程 =================
 
-const version = "1.1.1"
+const version = "1.1.2"
 
 var stdin = bufio.NewReader(os.Stdin)
 
@@ -1188,8 +1263,8 @@ func showHelp() {
   检测项
     1 环境概览    出口 IP / 运营商 / 本机网卡地址
     2 延迟抖动    TCP 握手到 5 个公共节点
-    3 下载测速    Cloudflare 公共测速端点
-    4 上传测速    同上
+    3 下载测速    国内镜像大文件多源并发，测本机接入带宽
+    4 上传测速    Cloudflare 国际端点上行（参考值）
     5 NAT 类型    STUN 检测，输出 NAT1-4
     6 IPv6       地址 / AAAA 解析 / 真实连通性
     7 上游测速    指定 IP:Port 的 TCP 延迟 + HTTP 下载
@@ -1207,7 +1282,10 @@ func showHelp() {
 
   与原网页的差异
     - 网页测的是「路由器到公网」，这里测「本机到公网」
-    - 网页的 SpeedTest(Ookla) 换成 Cloudflare 端点（Ookla 协议未公开）
+    - 下行改用国内镜像大文件长连接：Cloudflare 的 __down 在境内常被 429/403 限流，
+      且跨境链路本来就测不出本地接入带宽；多源并发可避免单站限速
+    - 上行仍用 Cloudflare 国际端点，只代表「到境外节点的上行」，
+      1000M 家宽上行通常也只有 30~100 Mbps，和下行不对称是正常的
     - 开了系统代理 / TUN 时，测速前会做出口体检；确认不了直连就跳过测速，
       不再把代理链路的吞吐当成本机宽带报出来
 
@@ -1253,8 +1331,8 @@ func menu() {
 		fmt.Println(col(cCyan, strings.Repeat("=", 64)))
 		fmt.Println("   1  环境概览        出口 IP / 运营商 / 本机地址")
 		fmt.Println("   2  延迟与抖动      到 5 个公共节点")
-		fmt.Println("   3  下载测速        Cloudflare 多线程")
-		fmt.Println("   4  上传测速        Cloudflare 多线程")
+		fmt.Println("   3  下载测速        国内镜像多源并发")
+		fmt.Println("   4  上传测速        Cloudflare 国际出口")
 		fmt.Println("   5  NAT 类型检测    STUN，NAT1-4")
 		fmt.Println("   6  IPv6 就绪度     地址 / 解析 / 连通")
 		fmt.Println("   7  上游节点测速    自定义 IP:Port")

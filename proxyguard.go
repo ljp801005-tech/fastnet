@@ -182,11 +182,21 @@ func httpText(c *http.Client, rawurl string) (string, error) {
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	b, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
-	if err != nil {
-		return "", err
+	// 分块读、拿到内容就走，不等服务器主动关连接。
+	// 有些站点 keep-alive 不主动断流，ReadAll 会一直等到 client 超时。
+	r := io.LimitReader(resp.Body, 1<<16)
+	var sb strings.Builder
+	buf := make([]byte, 4096)
+	for i := 0; i < 16 && sb.Len() < 1<<16; i++ {
+		n, e := r.Read(buf)
+		if n > 0 {
+			sb.Write(buf[:n])
+		}
+		if e != nil {
+			break
+		}
 	}
-	return string(b), nil
+	return sb.String(), nil
 }
 
 // 测速端点自己的 trace：这才是测速流量真正走的出口。
@@ -300,55 +310,88 @@ func hostingEgress(org string) bool {
 }
 
 // 一次进程内只体检一次，下载/上传共用结论。
+// 原则：只有「系统层确实会接管流量」的证据才跳过测速；
+// 单纯的环境变量、或一次探测超时，都不能把测速卡住或误判成代理环境。
 func checkSpeedPath() speedPath {
 	pathOnce.Do(func() {
+		info("正在核对测速路径（最多 2 秒）…")
 		r := speedPath{}
-		if v := proxyEnvValue(); v != "" {
-			r.ProxyLike = true
-			r.Reasons = append(r.Reasons, "代理环境变量: "+v)
+
+		envProxy := proxyEnvValue()
+		sysProxy := systemProxyValue()
+		tuns := tunNames()
+		hardProxy := false
+		if sysProxy != "" {
+			hardProxy = true
+			r.Reasons = append(r.Reasons, "Windows 系统代理: "+sysProxy)
 		}
-		if v := systemProxyValue(); v != "" {
-			r.ProxyLike = true
-			r.Reasons = append(r.Reasons, "Windows 系统代理: "+v)
+		if len(tuns) > 0 {
+			hardProxy = true
+			r.Reasons = append(r.Reasons, "TUN/虚拟网卡: "+strings.Join(tuns, ", "))
 		}
-		if ns := tunNames(); len(ns) > 0 {
+		if envProxy != "" {
 			r.ProxyLike = true
-			r.Reasons = append(r.Reasons, "TUN/虚拟网卡: "+strings.Join(ns, ", "))
+			r.Reasons = append(r.Reasons, "代理环境变量: "+envProxy+"（测速客户端不使用它）")
 		}
 
-		const probeTimeout = 5 * time.Second
-		base := directClient(false, probeTimeout)
-		defer base.CloseIdleConnections()
-
-		r.LocalIP, r.LocalRegion = probeLocalEgress(base)
-		e1, err := probeSpeedEgress(base)
-		if err == nil {
-			r.SpeedIP, r.SpeedRegion = e1.ip, e1.region
-		} else {
-			r.Note = "测速端点不可达: " + err.Error()
+		// 两个出口探测并发跑，整体 2.2 秒硬上限；失败只影响提示，不阻塞测速。
+		type baseRes struct{ ip, region string }
+		type cfRes struct {
+			e   egress
+			err error
+		}
+		baseCh := make(chan baseRes, 1)
+		cfCh := make(chan cfRes, 1)
+		probe := directClient(false, 2*time.Second)
+		defer probe.CloseIdleConnections()
+		go func() {
+			ip, reg := probeLocalEgress(probe)
+			baseCh <- baseRes{ip, reg}
+		}()
+		go func() {
+			e, err := probeSpeedEgress(probe)
+			cfCh <- cfRes{e, err}
+		}()
+		deadline := time.After(2200 * time.Millisecond)
+		gotBase, gotCF := false, false
+		for !gotBase || !gotCF {
+			select {
+			case b := <-baseCh:
+				r.LocalIP, r.LocalRegion = b.ip, b.region
+				gotBase = true
+			case c := <-cfCh:
+				gotCF = true
+				if c.err == nil {
+					r.SpeedIP, r.SpeedRegion = c.e.ip, c.e.region
+				} else {
+					r.Note = "国际端点探测失败: " + c.err.Error()
+				}
+			case <-deadline:
+				gotBase, gotCF = true, true
+				r.Note = "出口探测超时，按本地配置判定"
+			}
 		}
 
-		if e1.region != "" && r.LocalRegion != "" &&
-			normRegion(e1.region) != normRegion(r.LocalRegion) {
-			r.ProxyLike = true
+		// 测速目标出口与宽带出口地区不同 = 分流/代理的硬证据。
+		if r.SpeedRegion != "" && r.LocalRegion != "" &&
+			normRegion(r.SpeedRegion) != normRegion(r.LocalRegion) {
+			hardProxy = true
 			r.Reasons = append(r.Reasons, fmt.Sprintf(
-				"测速目标出口在 %s (%s)，本机宽带出口在 %s —— 测速流量被分流/代理",
-				e1.region, e1.ip, r.LocalRegion))
-		}
-		if e1.ip != "" && hostingEgress(probeOrg(base, e1.ip)) {
-			r.ProxyLike = true
-			r.Reasons = append(r.Reasons, "测速出口属于机房/云服务商，不是家宽出口")
+				"国际端点出口在 %s (%s)，本机宽带出口在 %s —— 流量被分流/代理",
+				r.SpeedRegion, r.SpeedIP, r.LocalRegion))
 		}
 
-		// 干净环境 + 探测正常：直接放行。
-		if !r.ProxyLike && err == nil {
+		if !hardProxy {
 			r.DirectOK = true
+			if r.ProxyLike {
+				info("仅检测到代理环境变量，测速强制直连，按直连处理")
+			}
 			pathResult = r
 			return
 		}
 
-		// 有代理痕迹：绑定物理网卡源地址，尝试强制走本地直连。
-		bound := directClient(true, probeTimeout)
+		// 系统层代理：绑定物理网卡源地址，尝试强制走本地直连。
+		bound := directClient(true, 2*time.Second)
 		defer bound.CloseIdleConnections()
 		e2, err2 := probeSpeedEgress(bound)
 		if err2 == nil && r.LocalIP != "" && e2.ip == r.LocalIP {
