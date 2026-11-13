@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0b0f14">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>FastNet 移动版 · 网络体检</title>
+<style>
+:root{
+  --bg:#0b0f14; --card:#131a22; --card2:#0f151c; --line:#1f2a36;
+  --txt:#e6edf3; --mut:#8b98a5; --dim:#5d6b7a;
+  --ok:#34d399; --warn:#fbbf24; --bad:#f87171; --accent:#38bdf8; --accent2:#2dd4bf;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;padding:0}
+body{
+  background:radial-gradient(1200px 600px at 50% -10%,#12202e 0%,var(--bg) 55%) no-repeat,var(--bg);
+  color:var(--txt); font:15px/1.55 -apple-system,BlinkMacSystemFont,"PingFang SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif;
+  padding:calc(12px + env(safe-area-inset-top)) 14px calc(20px + env(safe-area-inset-bottom));
+  min-height:100vh; -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:560px;margin:0 auto}
+header{display:flex;align-items:center;gap:10px;margin:4px 0 16px}
+.logo{width:38px;height:38px;border-radius:12px;background:linear-gradient(140deg,var(--accent),var(--accent2));
+  display:grid;place-items:center;font-weight:800;color:#06131b;font-size:17px;flex:0 0 auto}
+h1{font-size:19px;margin:0;font-weight:700;letter-spacing:.2px}
+.sub{color:var(--mut);font-size:12px;margin-top:1px}
+.acts{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}
+button{
+  font:inherit;font-weight:600;border:0;border-radius:14px;padding:15px 12px;color:#06131b;
+  background:linear-gradient(135deg,var(--accent),var(--accent2));cursor:pointer;
+  transition:transform .08s ease,opacity .2s;
+}
+button:active{transform:scale(.97)}
+button:disabled{opacity:.45}
+button.ghost{background:var(--card);color:var(--txt);border:1px solid var(--line)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:14px;margin-bottom:12px}
+.card h2{font-size:13px;margin:0 0 10px;color:var(--mut);font-weight:600;letter-spacing:.4px;
+  display:flex;justify-content:space-between;align-items:center}
+.row{display:flex;justify-content:space-between;align-items:baseline;gap:12px;padding:6px 0;border-top:1px dashed rgba(255,255,255,.05)}
+.row:first-of-type{border-top:0}
+.k{color:var(--mut);font-size:13px;flex:0 0 auto}
+.v{font-variant-numeric:tabular-nums;text-align:right;font-size:14px;word-break:break-all}
+.big{font-size:27px;font-weight:700;letter-spacing:-.5px}
+.grad{background:linear-gradient(120deg,var(--accent),var(--accent2));-webkit-background-clip:text;background-clip:text;color:transparent}
+.tag{font-size:11px;padding:2px 8px;border-radius:999px;border:1px solid var(--line);color:var(--mut);font-weight:500}
+.tag.ok{color:var(--ok);border-color:rgba(52,211,153,.35);background:rgba(52,211,153,.08)}
+.tag.warn{color:var(--warn);border-color:rgba(251,191,36,.35);background:rgba(251,191,36,.08)}
+.tag.bad{color:var(--bad);border-color:rgba(248,113,113,.35);background:rgba(248,113,113,.08)}
+.bar{height:6px;border-radius:6px;background:#1b2531;overflow:hidden;margin-top:8px}
+.bar i{display:block;height:100%;width:0;border-radius:6px;background:linear-gradient(90deg,var(--accent),var(--accent2));transition:width .25s}
+#log{font:11.5px/1.6 ui-monospace,Menlo,Consolas,monospace;color:var(--dim);white-space:pre-wrap;
+  max-height:130px;overflow:auto;background:var(--card2);border:1px solid var(--line);border-radius:12px;padding:10px}
+.hint{color:var(--dim);font-size:11.5px;line-height:1.6;margin-top:8px}
+.spin{width:13px;height:13px;border:2px solid rgba(255,255,255,.25);border-top-color:var(--accent);
+  border-radius:50%;display:inline-block;animation:sp .7s linear infinite;vertical-align:-2px}
+@keyframes sp{to{transform:rotate(360deg)}}
+.mini{font-size:11.5px;color:var(--dim)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="logo">FN</div>
+    <div>
+      <h1>FastNet 移动版</h1>
+      <div class="sub">在本机直接测，不装任何插件</div>
+    </div>
+  </header>
+
+  <div class="acts">
+    <button id="btnAll">一键体检</button>
+    <button id="btnSpeed" class="ghost">只测速</button>
+  </div>
+
+  <div class="card" id="c-env">
+    <h2>环境概览 <span class="tag" id="s-env">待测</span></h2>
+    <div class="row"><span class="k">网络类型</span><span class="v" id="v-net">—</span></div>
+    <div class="row"><span class="k">公网 IPv4</span><span class="v" id="v-ip">—</span></div>
+    <div class="row"><span class="k">归属地</span><span class="v" id="v-loc">—</span></div>
+    <div class="row"><span class="k">运营商</span><span class="v" id="v-isp">—</span></div>
+    <div class="row"><span class="k">公网 IPv6</span><span class="v" id="v-ip6">—</span></div>
+  </div>
+
+  <div class="card" id="c-lat">
+    <h2>延迟与抖动 <span class="tag" id="s-lat">待测</span></h2>
+    <div id="latList"></div>
+  </div>
+
+  <div class="card" id="c-down">
+    <h2>下载速度 <span class="tag" id="s-down">待测</span></h2>
+    <div class="big grad" id="v-down">—</div>
+    <div class="bar"><i id="pb-down"></i></div>
+    <div class="mini" id="m-down">Cloudflare 多线程</div>
+  </div>
+
+  <div class="card" id="c-up">
+    <h2>上传速度 <span class="tag" id="s-up">待测</span></h2>
+    <div class="big grad" id="v-up">—</div>
+    <div class="bar"><i id="pb-up"></i></div>
+    <div class="mini" id="m-up">Cloudflare 多线程</div>
+  </div>
+
+  <div class="card" id="c-nat">
+    <h2>NAT 类型 <span class="tag" id="s-nat">待测</span></h2>
+    <div class="row"><span class="k">判定</span><span class="v" id="v-nat">—</span></div>
+    <div class="row"><span class="k">公网映射</span><span class="v" id="v-map">—</span></div>
+    <div class="hint">浏览器只能做近似判定（无法区分完全锥形/受限/端口受限），精确结果请用桌面版。</div>
+  </div>
+
+  <div class="card" id="c-v6">
+    <h2>IPv6 就绪度 <span class="tag" id="s-v6">待测</span></h2>
+    <div class="row"><span class="k">IPv6 出口</span><span class="v" id="v-v6">—</span></div>
+    <div class="row"><span class="k">访问 IPv6 网站</span><span class="v" id="v-v6web">—</span></div>
+  </div>
+
+  <div class="card">
+    <h2>日志</h2>
+    <div id="log">就绪</div>
+    <div class="hint">手机浏览器无法测「手机 ↔ 路由器」的内网带宽（沙箱限制），这项要用桌面版 fastnet。</div>
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const logBox = $("log");
+function log(s){
+  const t = new Date().toTimeString().slice(0,8);
+  logBox.textContent += "\n" + t + "  " + s;
+  logBox.scrollTop = logBox.scrollHeight;
+}
+const setTag = (id, text, cls) => { const e=$(id); e.textContent=text; e.className="tag"+(cls?" "+cls:""); };
+function fmtRate(mbps){
+  if (mbps >= 1000) return (mbps/1000).toFixed(2) + " Gbps";
+  if (mbps >= 1) return mbps.toFixed(2) + " Mbps";
+  if (mbps >= 0.001) return (mbps*1000).toFixed(0) + " Kbps";
+  return "—";
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+/* ---------------- 环境 ---------------- */
+async function testEnv(){
+  setTag("s-env","检测中","");
+  const c = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+  if (c) $("v-net").textContent = (c.effectiveType||"").toUpperCase() + (c.downlink?(" · 约 "+c.downlink+" Mbps"):"") ;
+  else $("v-net").textContent = "浏览器未提供";
+
+  // 公网 IPv4 + 归属地：多源兜底
+  let ip="", loc="", isp="";
+  try{
+    const r = await fetch("https://ipinfo.io/json", {cache:"no-store"});
+    const j = await r.json();
+    ip = j.ip||""; 
+    loc = [j.country, j.region, j.city].filter(Boolean).join(" ");
+    isp = j.org||"";
+  }catch(e){ log("ipinfo 失败，换源"); }
+  if(!ip){
+    try{
+      const r = await fetch("https://api.ipify.org?format=json",{cache:"no-store"});
+      ip = (await r.json()).ip||"";
+    }catch(e){}
+  }
+  if(!loc){
+    try{
+      const r = await fetch("https://www.cloudflare.com/cdn-cgi/trace",{cache:"no-store"});
+      const txt = await r.text();
+      const m = {}; txt.trim().split("\n").forEach(l=>{const i=l.indexOf("="); if(i>0) m[l.slice(0,i)]=l.slice(i+1);});
+      if(!ip) ip = m.ip||"";
+      loc = m.loc||"";
+    }catch(e){}
+  }
+  $("v-ip").textContent = ip || "未取到";
+  $("v-loc").textContent = loc || "—";
+  $("v-isp").textContent = isp || "—";
+  setTag("s-env", ip?"完成":"部分失败", ip?"ok":"warn");
+  log("公网 IPv4: " + (ip||"失败") + (isp?(" / "+isp):""));
+  return {ip, loc, isp};
+}
+
+/* ---------------- 延迟 ---------------- */
+const LAT_TARGETS = [
+  {name:"百度",     url:"https://www.baidu.com/favicon.ico"},
+  {name:"腾讯",     url:"https://www.qq.com/favicon.ico"},
+  {name:"阿里",     url:"https://www.taobao.com/favicon.ico"},
+  {name:"华为探测", url:"https://connectivitycheck.platform.hicloud.com/generate_204"},
+  {name:"Cloudflare",url:"https://cloudflare.com/cdn-cgi/trace"}
+];
+
+async function pingOnce(url, timeout){
+  const ac = new AbortController();
+  const to = setTimeout(()=>ac.abort(), timeout);
+  const t0 = performance.now();
+  try{
+    await fetch(url + (url.includes("?")?"&":"?") + "_=" + Math.random(),
+                {mode:"no-cors", cache:"no-store", signal:ac.signal});
+    return performance.now() - t0;
+  }catch(e){ return null; }
+  finally{ clearTimeout(to); }
+}
+
+async function testLatency(){
+  setTag("s-lat","测试中","");
+  $("latList").innerHTML = "";
+  const results = [];
+  for(const t of LAT_TARGETS){
+    const vals = [];
+    for(let i=0;i<4;i++){
+      const d = await pingOnce(t.url, 3500);
+      if(d!==null && i>0) vals.push(d);   // 首包含 DNS/TLS 建连，丢弃
+    }
+    let avg=null, jitter=null, loss=100;
+    if(vals.length){
+      vals.sort((a,b)=>a-b);
+      avg = vals[0];                                   // 最小值最接近网络 RTT
+      if(vals.length>1){
+        let j=0; for(let i=1;i<vals.length;i++) j+=Math.abs(vals[i]-vals[i-1]);
+        jitter = j/(vals.length-1);
+      }
+      loss = Math.max(0, (3-vals.length)/3*100);
+    }
+    results.push({name:t.name, avg, jitter, loss});
+    addLatRow(t.name, avg, jitter);
+    log(t.name + ": " + (avg===null?"不可达":avg.toFixed(0)+" ms"));
+  }
+  const okList = results.filter(r=>r.avg!==null).map(r=>r.avg);
+  if(okList.length){
+    const best = Math.min(...okList);
+    setTag("s-lat", best<60?"很好":(best<150?"正常":"偏高"), best<60?"ok":(best<150?"":"warn"));
+  }else{
+    setTag("s-lat","全部失败","bad");
+  }
+  return results;
+}
+
+function addLatRow(name, avg, jitter){
+  const d = document.createElement("div");
+  d.className = "row";
+  const cls = avg===null ? "bad" : (avg<60?"ok":(avg<150?"warn":"bad"));
+  d.innerHTML = '<span class="k">'+name+'</span><span class="v">'+
+    (avg===null ? '<span class="tag bad">不可达</span>'
+      : '<span class="tag '+cls+'">'+avg.toFixed(0)+' ms</span>'+
+        (jitter!==null?' <span class="mini">抖动 '+jitter.toFixed(0)+' ms</span>':''))+'</span>';
+  $("latList").appendChild(d);
+}
+
+/* ---------------- 下载 ---------------- */
+async function testDownload(seconds=8, conns=4){
+  setTag("s-down","测速中","");
+  const end = performance.now() + seconds*1000;
+  let total = 0, stop = false;
+  const t0 = performance.now();
+
+  const timer = setInterval(()=>{
+    const el = (performance.now()-t0)/1000;
+    if(el>0.3){
+      const mbps = total*8/el/1e6;
+      $("v-down").textContent = fmtRate(mbps);
+      $("pb-down").style.width = Math.min(100, el/seconds*100) + "%";
+    }
+  }, 200);
+
+  const workers = [];
+  for(let i=0;i<conns;i++){
+    workers.push((async()=>{
+      while(!stop && performance.now()<end){
+        const ac = new AbortController();
+        const k = setTimeout(()=>ac.abort(), Math.max(1500, end-performance.now()+2500));
+        try{
+          const r = await fetch("https://speed.cloudflare.com/__down?bytes=26214400&_="+Math.random(),
+                                {cache:"no-store", signal:ac.signal});
+          if(!r.ok || !r.body){ await sleep(120); continue; }
+          const rd = r.body.getReader();
+          while(true){
+            const {done, value} = await rd.read();
+            if(done) break;
+            total += value.length;
+            if(performance.now()>end){ try{rd.cancel();}catch(e){} break; }
+          }
+        }catch(e){ /* 到时间被中断，正常 */ }
+        finally{ clearTimeout(k); }
+      }
+    })());
+  }
+  await Promise.all(workers);
+  stop = true;
+  clearInterval(timer);
+
+  const el = (performance.now()-t0)/1000;
+  const mbps = total*8/el/1e6;
+  $("v-down").textContent = fmtRate(mbps);
+  $("pb-down").style.width = "100%";
+  $("m-down").textContent = "传输 " + (total/1048576).toFixed(1) + " MB / " + el.toFixed(1) + " 秒";
+  setTag("s-down", total>0?"完成":"失败", total>0?"ok":"bad");
+  log("下载: " + fmtRate(mbps) + "（" + (total/1048576).toFixed(1) + " MB）");
+  return mbps;
+}
+
+/* ---------------- 上传 ---------------- */
+async function testUpload(seconds=6, conns=3){
+  setTag("s-up","测速中","");
+  const end = performance.now() + seconds*1000;
+  let total = 0, stop = false;
+  const t0 = performance.now();
+  const blob = new Blob([new Uint8Array(8*1024*1024)], {type:"application/octet-stream"});
+
+  const timer = setInterval(()=>{
+    const el = (performance.now()-t0)/1000;
+    if(el>0.3){
+      const mbps = total*8/el/1e6;
+      $("v-up").textContent = fmtRate(mbps);
+      $("pb-up").style.width = Math.min(100, el/seconds*100) + "%";
+    }
+  }, 200);
+
+  const workers = [];
+  for(let i=0;i<conns;i++){
+    workers.push((async()=>{
+      while(!stop && performance.now()<end){
+        const ac = new AbortController();
+        const k = setTimeout(()=>ac.abort(), Math.max(2000, end-performance.now()+3000));
+        try{
+          const r = await fetch("https://speed.cloudflare.com/__up",{
+            method:"POST", body:blob, cache:"no-store", signal:ac.signal,
+            headers:{"Content-Type":"application/octet-stream"}
+          });
+          if(r.ok) total += blob.size;
+        }catch(e){}
+        finally{ clearTimeout(k); }
+      }
+    })());
+  }
+  await Promise.all(workers);
+  stop = true;
+  clearInterval(timer);
+
+  const el = (performance.now()-t0)/1000;
+  const mbps = total*8/el/1e6;
+  $("v-up").textContent = total>0?fmtRate(mbps):"—";
+  $("pb-up").style.width = "100%";
+  $("m-up").textContent = total>0 ? ("传输 " + (total/1048576).toFixed(1) + " MB / " + el.toFixed(1) + " 秒") : "接口不可用或被拦截";
+  setTag("s-up", total>0?"完成":"失败", total>0?"ok":"bad");
+  log("上传: " + (total>0?fmtRate(mbps):"失败"));
+  return mbps;
+}
+
+/* ---------------- NAT（WebRTC 近似） ---------------- */
+async function testNAT(){
+  setTag("s-nat","检测中","");
+  const servers = ["stun:stun.miwifi.com:3478","stun:stun.qq.com:3478","stun:stun.l.google.com:19302"];
+  // 一次连接挂多个 STUN，保证本地端口一致，映射端口才具可比性
+  const list = await gatherSrflxAll(servers, 5000);
+  if(!list.length){
+    $("v-nat").innerHTML = '<span class="tag bad">无法判断</span>';
+    $("v-map").textContent = "未收到 STUN 响应（UDP 可能被运营商或路由器阻断）";
+    setTag("s-nat","UDP 受限","bad");
+    log("NAT: 无 STUN 响应");
+    return null;
+  }
+  const pub = list[0].ip + ":" + list[0].port;
+  $("v-map").textContent = pub;
+
+  // 按本地端口分组，比较同一本地端口在不同服务器上看到的映射端口
+  const groups = {};
+  list.forEach(x=>{ const k = x.related===null?"?":x.related; (groups[k]=groups[k]||new Set()).add(x.port); });
+  let symmetric = false, cone = false;
+  Object.values(groups).forEach(set=>{ if(set.size>1) symmetric = true; else cone = true; });
+
+  let verdict, cls;
+  if(symmetric && !cone){ verdict="对称 NAT（NAT4 近似）"; cls="warn"; }
+  else if(cone && !symmetric){ verdict="锥形 NAT（NAT1/NAT2 近似）"; cls="ok"; }
+  else if(cone && symmetric){ verdict="混合（部分端口锥形）"; cls="warn"; }
+  else { verdict="无法判断"; cls="warn"; }
+
+  $("v-nat").innerHTML = '<span class="tag '+cls+'">'+verdict+'</span>';
+  setTag("s-nat","完成",cls);
+  log("NAT: " + verdict + "  映射 " + pub);
+  return {verdict, pub};
+}
+
+function gatherSrflxAll(servers, wait){
+  return new Promise(resolve=>{
+    let pc;
+    try{ pc = new RTCPeerConnection({iceServers: servers.map(u=>({urls:u}))}); }
+    catch(e){ return resolve([]); }
+    const out = [];
+    const finish = ()=>{ try{pc.close();}catch(e){}; resolve(out); };
+    pc.onicecandidate = ev=>{
+      const c = ev.candidate;
+      if(!c) return;
+      const s = c.candidate || "";
+      if(c.type === "srflx") out.push({ip:c.address, port:c.port, related:c.relatedPort});
+      else if(!c.type && /typ srflx/.test(s)){
+        const p = s.split(" ");
+        out.push({ip:p[4], port:parseInt(p[5],10), related:null});
+      }
+    };
+    try{
+      pc.createDataChannel("x");
+      pc.createOffer().then(o=>pc.setLocalDescription(o)).catch(()=>{});
+    }catch(e){}
+    setTimeout(finish, wait);
+  });
+}
+
+/* ---------------- IPv6 ---------------- */
+async function testIPv6(){
+  setTag("s-v6","检测中","");
+  let addr = "";
+  try{
+    const r = await fetch("https://api6.ipify.org?format=json&_="+Math.random(), {cache:"no-store"});
+    const j = await r.json();
+    addr = j.ip || "";
+  }catch(e){}
+  $("v-v6").textContent = addr || "无（当前网络不支持 IPv6）";
+  $("v-ip6").textContent = addr || "无";
+  let web = false;
+  try{
+    const d = await pingOnce("https://ipv6.icanhazip.com/", 4000);
+    web = d !== null;
+  }catch(e){}
+  $("v-v6web").innerHTML = web ? '<span class="tag ok">可访问</span>' : '<span class="tag bad">不可访问</span>';
+  setTag("s-v6", addr?"可用":"不支持", addr?"ok":"bad");
+  log("IPv6: " + (addr || "无地址"));
+  return addr;
+}
+
+/* ---------------- 一键 ---------------- */
+let running = false;
+function setRunning(v){
+  running = v;
+  $("btnAll").disabled = v;
+  $("btnSpeed").disabled = v;
+}
+
+async function runAll(){
+  if(running) return;
+  setRunning(true);
+  logBox.textContent = "开始体检";
+  try{
+    await testEnv();
+    await testLatency();
+    await testDownload(8,4);
+    await testUpload(6,3);
+    await testNAT();
+    await testIPv6();
+    log("体检结束");
+  }catch(e){
+    log("出错: " + e.message);
+  }finally{
+    setRunning(false);
+  }
+}
+
+async function runSpeedOnly(){
+  if(running) return;
+  setRunning(true);
+  logBox.textContent = "开始测速";
+  try{
+    await testDownload(8,4);
+    await sleep(600);
+    await testUpload(6,3);
+  }catch(e){ log("出错: "+e.message); }
+  finally{ setRunning(false); }
+}
+
+$("btnAll").onclick = runAll;
+$("btnSpeed").onclick = runSpeedOnly;
+
+/* 打开时先把网络类型填上，顺便探一下 IPv6 是否有地址 */
+(function init(){
+  const c = navigator.connection;
+  if(c) $("v-net").textContent = (c.effectiveType||"").toUpperCase() + (c.downlink?(" · 约 "+c.downlink+" Mbps"):"");
+  log("页面已加载，点「一键体检」开始");
+  // 地址栏加 #auto 可自动开测（方便收藏成书签）
+  if(location.hash === "#auto") setTimeout(runAll, 300);
+})();
+</script>
+</body>
+</html>

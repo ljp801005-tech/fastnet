@@ -1,0 +1,14 @@
+# 编译产物
+dist/
+results/
+*.exe
+fastnet
+FastNet-mac-universal
+
+# 打包
+*.zip
+*.tar.gz
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
