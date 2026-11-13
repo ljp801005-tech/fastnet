@@ -54,7 +54,7 @@
 
 ## 下载与安装
 
-到 [Releases](../../releases) 下载最新的包，解压即用，**不需要装 Python、.NET、运行库**。
+到 [Releases](https://github.com/ljp801005-tech/fastnet/releases) 下载最新的包，解压即用，**不需要装 Python、.NET、运行库**。
 
 | 平台 | 文件 | 说明 |
 | --- | --- | --- |
