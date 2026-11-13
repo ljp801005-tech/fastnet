@@ -341,10 +341,15 @@ func runEnv() *EnvInfo {
 
 	if e.ProxyEnv != "" {
 		warn("检测到代理环境变量: " + e.ProxyEnv)
-		info("本工具默认直连测试，不经过代理；如需走代理请加 -proxy 参数")
+		info("公网测速强制直连；无法确认直连时会自动跳过，不会给出代理链路的带宽")
+	}
+	if v := systemProxyValue(); v != "" {
+		warn("检测到 Windows 系统代理: " + v)
+		info("系统代理与 TUN 会在系统层接管流量，测速前会做出口体检")
 	}
 	if hasFake {
-		warn("检测到 TUN/透明代理虚拟网卡（198.18.x.x），测速结果可能代表代理出口而非本机")
+		warn("检测到 TUN/透明代理虚拟网卡（198.18.x.x），公网测速可能被跳过")
+		info("关闭 Clash/V2Ray 的 TUN 模式后重测，或用菜单 8 测内网带宽")
 	}
 	return e
 }
@@ -441,6 +446,9 @@ type speedResult struct {
 	Seconds   float64 `json:"seconds"`
 	Conns     int     `json:"conns"`
 	Server    string  `json:"server"`
+	Skipped   bool    `json:"skipped,omitempty"`
+	Reason    string  `json:"reason,omitempty"`
+	Egress    string  `json:"egress,omitempty"`
 }
 
 func speedProgress(label string, total *int64, start time.Time, done <-chan struct{}) {
@@ -472,11 +480,45 @@ func runSpeed(up bool) speedResult {
 	title(name + " (Cloudflare)")
 	info(fmt.Sprintf("时长 %d 秒 / 并发 %d / 数据源 speed.cloudflare.com", cfg.SpeedSeconds, cfg.SpeedConns))
 
+	direction := map[bool]string{true: "upload", false: "download"}[up]
+
+	// 测速前先确认「测速流量」走的是本机宽带直连，而不是代理 / TUN 出口。
+	// 绕不过代理就跳过，绝不给一个看似正常、实际失真的带宽数字。
+	path := checkSpeedPath()
+	if !path.DirectOK && !forceSpeed {
+		warn("检测到代理/TUN，已跳过公网测速（不把代理链路速率当成本机带宽）")
+		for _, why := range path.Reasons {
+			info("· " + why)
+		}
+		if path.SpeedIP != "" {
+			info(fmt.Sprintf("测速目标实际出口: %s (%s)", path.SpeedIP, path.SpeedRegion))
+		}
+		if path.Note != "" {
+			info(path.Note)
+		}
+		info("请关闭系统代理 / Clash TUN 模式，或把 speed.cloudflare.com 加入直连规则后重测")
+		info("只想验证内网瓶颈可用菜单 8（内网带宽），它不走公网、不受代理影响")
+		return speedResult{
+			Direction: direction,
+			Conns:     cfg.SpeedConns,
+			Server:    "speed.cloudflare.com",
+			Skipped:   true,
+			Reason:    strings.Join(path.Reasons, "; "),
+			Egress:    path.SpeedIP,
+		}
+	}
+	if path.BindPhysical {
+		info("已绑定物理网卡直连，测速流量绕过代理")
+	}
+	if forceSpeed && !path.DirectOK {
+		warn("强制测速：结果只代表当前代理链路，不代表宽带带宽")
+	}
+
 	var total int64
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.SpeedSeconds)*time.Second)
 	defer cancel()
 
-	client := newClient(60 * time.Second)
+	client := directClient(path.BindPhysical, 60*time.Second)
 	defer client.CloseIdleConnections()
 
 	payload := make([]byte, 8<<20)
@@ -567,7 +609,7 @@ finish:
 	fmt.Printf("\r%60s\r", "")
 
 	res := speedResult{
-		Direction: map[bool]string{true: "upload", false: "download"}[up],
+		Direction: direction,
 		Bytes:     atomic.LoadInt64(&total),
 		Seconds:   elapsed,
 		Conns:     cfg.SpeedConns,
@@ -1087,11 +1129,19 @@ func summaryBanner(rep *Report) {
 			line("平均延迟", fmt.Sprintf("%.1f ms（最佳 %s %.1f ms）", sum/float64(okCount), best.Name, best.AvgMs))
 		}
 	}
-	if rep.Download != nil && rep.Download.Bps > 0 {
-		line("下行带宽", rate(rep.Download.Bps))
+	if rep.Download != nil {
+		if rep.Download.Skipped {
+			line("下行带宽", "已跳过（代理环境，不测代理链路）")
+		} else if rep.Download.Bps > 0 {
+			line("下行带宽", rate(rep.Download.Bps))
+		}
 	}
-	if rep.Upload != nil && rep.Upload.Bps > 0 {
-		line("上行带宽", rate(rep.Upload.Bps))
+	if rep.Upload != nil {
+		if rep.Upload.Skipped {
+			line("上行带宽", "已跳过（代理环境，不测代理链路）")
+		} else if rep.Upload.Bps > 0 {
+			line("上行带宽", rate(rep.Upload.Bps))
+		}
 	}
 	if rep.NAT != nil && rep.NAT.Type != "" {
 		line("NAT 类型", rep.NAT.Type)
@@ -1118,7 +1168,7 @@ func summaryBanner(rep *Report) {
 
 // ================= 主流程 =================
 
-const version = "1.1.0"
+const version = "1.1.1"
 
 var stdin = bufio.NewReader(os.Stdin)
 
@@ -1158,7 +1208,8 @@ func showHelp() {
   与原网页的差异
     - 网页测的是「路由器到公网」，这里测「本机到公网」
     - 网页的 SpeedTest(Ookla) 换成 Cloudflare 端点（Ookla 协议未公开）
-    - 开了全局代理 / TUN 时，结果代表代理出口而非本机宽带，程序会提示
+    - 开了系统代理 / TUN 时，测速前会做出口体检；确认不了直连就跳过测速，
+      不再把代理链路的吞吐当成本机宽带报出来
 
   手机/平板
     菜单 W（或 fastnet web）把手机版页面共享到局域网，
@@ -1168,7 +1219,8 @@ func showHelp() {
   命令行    fastnet.exe all | env | latency | speed | nat | ipv6 | upstream 1.2.3.4:80
             fastnet.exe lan [IP:Port]    fastnet.exe serve [端口]
             fastnet.exe web [端口]
-  代理      默认直连；如需走系统代理，加 -proxy 参数`)
+  代理      测速前自动体检出口；检测到代理且无法直连时跳过测速，避免假带宽
+            -proxy 使用代理环境变量；-force-speed 强制测速（结果不可信）`)
 	fmt.Println()
 }
 
@@ -1322,13 +1374,16 @@ func main() {
 		switch strings.ToLower(a) {
 		case "-proxy", "--proxy":
 			useProxy = true
+		case "-force-speed", "--force-speed":
+			forceSpeed = true
 		case "-h", "--help", "help":
 			fmt.Println("用法: fastnet [选项] [命令]")
 			fmt.Println("命令: menu(默认) all env latency speed nat ipv6 upstream lan serve web")
 			fmt.Println("  lan [IP:Port]   内网（本机↔路由器）带宽测速，留空自动识别网关")
 			fmt.Println("  serve [端口]    启动内网测速服务端，供另一台电脑测本机（默认 5201）")
 			fmt.Println("  web [端口]      把手机版页面共享到局域网（默认 8899）")
-			fmt.Println("选项: -proxy  使用系统代理（默认直连）")
+			fmt.Println("选项: -proxy        使用代理环境变量（默认直连）")
+			fmt.Println("      -force-speed 代理环境下仍强制测速（结果不代表宽带，仅供诊断）")
 			return
 		default:
 			if mode == "" {
